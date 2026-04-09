@@ -2,15 +2,41 @@
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   const START_URL = 'https://zonatmo.nakamasweb.com/profile/lists';
-  const WAIT_BETWEEN_LIST_PAGES = 3000;
-  const WAIT_BETWEEN_LISTS = 5000;
-  const WAIT_BETWEEN_MANGAS = 5000;
-  const WAIT_ON_BLOCK = 120000;
+  const WAIT_ON_BLOCK_MIN = 90000;   // 90s
+  const WAIT_ON_BLOCK_MAX = 120000;  // 120s
   const MAX_RETRIES = 3;
 
   const finalResult = [];
   const seenListUrls = new Set();
-  const seenMangaByList = new Set();
+  const seenItemByList = new Set();
+
+  function randomInt(min, max) {
+    return Math.floor(Math.random() * (max - min + 1)) + min;
+  }
+
+  // Espera humana con prioridad alta a 3 segundos
+  function getHumanDelayMs() {
+    const roll = Math.random();
+
+    let seconds;
+    if (roll < 0.5) {
+      seconds = 3; // 50%
+    } else if (roll < 0.65) {
+      seconds = 2; // 15%
+    } else if (roll < 0.8) {
+      seconds = 4; // 15%
+    } else if (roll < 0.9) {
+      seconds = 1; // 10%
+    } else {
+      seconds = 5; // 10%
+    }
+
+    return seconds * 1000;
+  }
+
+  function getBlockDelayMs() {
+    return randomInt(WAIT_ON_BLOCK_MIN, WAIT_ON_BLOCK_MAX);
+  }
 
   function clean(text) {
     return (text || '')
@@ -34,8 +60,13 @@
   }
 
   function getInternalCode(url) {
-    const m = url.match(/\/library\/manga\/(\d+)\//i);
+    const m = url.match(/\/library\/[^/]+\/(\d+)\//i);
     return m ? m[1] : null;
+  }
+
+  function getTipoFromUrl(url) {
+    const m = url.match(/\/library\/([^/]+)\/\d+\/[^/]+/i);
+    return m ? m[1].toLowerCase() : null;
   }
 
   async function fetchDoc(url) {
@@ -62,8 +93,9 @@
 
         if (attempt >= MAX_RETRIES) throw err;
 
-        console.log(`⏸️ Esperando 2 minutos antes de reintentar ${label}...`);
-        await sleep(WAIT_ON_BLOCK);
+        const waitMs = getBlockDelayMs();
+        console.log(`⏸️ Esperando ${(waitMs / 1000).toFixed(0)}s antes de reintentar ${label}...`);
+        await sleep(waitMs);
       }
     }
   }
@@ -113,7 +145,10 @@
     let currentUrl = START_URL;
 
     while (currentUrl) {
-      const doc = await withRetries(`cargar página de listas ${currentUrl}`, () => fetchDoc(currentUrl));
+      const doc = await withRetries(
+        `cargar página de listas ${currentUrl}`,
+        () => fetchDoc(currentUrl)
+      );
 
       const lists = extractListsFromPage(doc, currentUrl);
       for (const list of lists) {
@@ -128,20 +163,27 @@
       if (!nextUrl || nextUrl === currentUrl) break;
 
       currentUrl = nextUrl;
-      await sleep(WAIT_BETWEEN_LIST_PAGES);
+
+      const waitMs = getHumanDelayMs();
+      console.log(`⏳ Esperando ${(waitMs / 1000).toFixed(0)}s antes de la siguiente página de listas...`);
+      await sleep(waitMs);
     }
 
     return allLists;
   }
 
-  function extractMangasFromList(doc) {
-    const anchors = [...doc.querySelectorAll('a[href*="/library/manga/"]')];
-    const mangas = [];
+  function extractItemsFromList(doc) {
+    const anchors = [...doc.querySelectorAll('a[href*="/library/"]')];
+    const items = [];
     const seen = new Set();
 
     for (const a of anchors) {
       const href = a.href;
       if (!href || seen.has(href)) continue;
+
+      // aceptar cualquier ficha real tipo /library/<tipo>/<id>/<slug>
+      if (!/\/library\/[^/]+\/\d+\/[^/]+/i.test(href)) continue;
+
       seen.add(href);
 
       let nombre =
@@ -151,10 +193,7 @@
 
       nombre = nombre
         .replace(/\.book-thumbnail-\d+::before.*?\}\s*/i, '')
-        .replace(/\bMANGA\b/gi, '')
-        .replace(/\bMANHWA\b/gi, '')
-        .replace(/\bMANHUA\b/gi, '')
-        .replace(/\bNOVELA\b/gi, '')
+        .replace(/\bMANGA\b|\bMANHWA\b|\bMANHUA\b|\bNOVELA\b|\bONE SHOT\b/gi, '')
         .replace(/\bShounen\b|\bSeinen\b|\bShoujo\b|\bJosei\b/gi, '')
         .replace(/^\d+(\.\d+)?/, '')
         .trim();
@@ -163,13 +202,13 @@
         nombre = href.split('/').pop().replace(/-/g, ' ');
       }
 
-      mangas.push({
+      items.push({
         nombre,
         url: href
       });
     }
 
-    return mangas;
+    return items;
   }
 
   function getViewAllUrl(url) {
@@ -216,15 +255,17 @@
     return Math.round(n * 100) / 100;
   }
 
-  async function processManga(mangaUrl, listName) {
-    const doc = await withRetries(`cargar manga ${mangaUrl}`, () => fetchDoc(mangaUrl));
+  async function processItem(itemUrl, listName) {
+    const doc = await withRetries(`cargar obra ${itemUrl}`, () => fetchDoc(itemUrl));
 
     const nombre =
       clean(doc.querySelector('.element-title')?.childNodes?.[0]?.textContent) ||
       clean(doc.querySelector('.element-title')?.textContent) ||
-      mangaUrl.split('/').pop();
+      itemUrl.split('/').pop();
 
-    const tipo = clean(doc.querySelector('.book-type')?.textContent) || null;
+    const descripcion = clean(doc.querySelector('.element-description')?.textContent) || null;
+    const tipoRuta = getTipoFromUrl(itemUrl);
+    const tipoFicha = clean(doc.querySelector('.book-type')?.textContent) || null;
     const demografia = clean(doc.querySelector('.demography')?.textContent) || null;
     const estado = clean(doc.querySelector('.book-status')?.textContent) || null;
 
@@ -232,7 +273,11 @@
       .map(x => clean(x.textContent))
       .filter(Boolean);
 
-    const chaptersDoc = await withRetries(`cargar capítulos ${mangaUrl}`, () => fetchDoc(getViewAllUrl(mangaUrl)));
+    const chaptersDoc = await withRetries(
+      `cargar capítulos ${itemUrl}`,
+      () => fetchDoc(getViewAllUrl(itemUrl))
+    );
+
     const chapters = parseChapters(chaptersDoc);
 
     let capituloActual = null;
@@ -254,12 +299,14 @@
     return {
       lista: listName,
       nombre,
-      url: mangaUrl,
-      tipo,
+      descripcion,
+      url: itemUrl,
+      tipoRuta,
+      tipoFicha,
       demografia,
       generos,
       estado,
-      codigoInterno: getInternalCode(mangaUrl),
+      codigoInterno: getInternalCode(itemUrl),
       capituloActual,
       capituloMaximo,
       progresoPorcentaje
@@ -282,35 +329,37 @@
       continue;
     }
 
-    const mangas = extractMangasFromList(listDoc);
-    console.log(`📘 Mangas encontrados en "${list.nombre}": ${mangas.length}`);
+    const items = extractItemsFromList(listDoc);
+    console.log(`📘 Obras encontradas en "${list.nombre}": ${items.length}`);
 
-    for (let j = 0; j < mangas.length; j++) {
-      const manga = mangas[j];
-      const key = `${list.url}__${manga.url}`;
+    for (let j = 0; j < items.length; j++) {
+      const item = items[j];
+      const key = `${list.url}__${item.url}`;
 
-      if (seenMangaByList.has(key)) continue;
-      seenMangaByList.add(key);
+      if (seenItemByList.has(key)) continue;
+      seenItemByList.add(key);
 
       try {
-        console.log(`   📖 [${j + 1}/${mangas.length}] ${manga.url}`);
-        const data = await processManga(manga.url, list.nombre);
+        console.log(`   📖 [${j + 1}/${items.length}] ${item.url}`);
+        const data = await processItem(item.url, list.nombre);
         finalResult.push(data);
 
         console.log(
-          `   ✅ ${data.nombre} | Actual: ${data.capituloActual} | Máx: ${data.capituloMaximo} | ${data.progresoPorcentaje}%`
+          `   ✅ ${data.nombre} | ${data.tipoRuta} | Actual: ${data.capituloActual} | Máx: ${data.capituloMaximo} | ${data.progresoPorcentaje}%`
         );
       } catch (err) {
-        console.warn(`   ❌ Error procesando manga ${manga.url}`, err);
+        console.warn(`   ❌ Error procesando obra ${item.url}`, err);
         finalResult.push({
           lista: list.nombre,
-          nombre: manga.nombre || null,
-          url: manga.url,
-          tipo: null,
+          nombre: item.nombre || null,
+          descripcion: null,
+          url: item.url,
+          tipoRuta: getTipoFromUrl(item.url),
+          tipoFicha: null,
           demografia: null,
           generos: [],
           estado: null,
-          codigoInterno: getInternalCode(manga.url),
+          codigoInterno: getInternalCode(item.url),
           capituloActual: null,
           capituloMaximo: null,
           progresoPorcentaje: null,
@@ -318,15 +367,17 @@
         });
       }
 
-      if (j < mangas.length - 1) {
-        console.log(`   ⏳ Esperando ${WAIT_BETWEEN_MANGAS / 1000}s entre mangas...`);
-        await sleep(WAIT_BETWEEN_MANGAS);
+      if (j < items.length - 1) {
+        const waitMs = getHumanDelayMs();
+        console.log(`   ⏳ Esperando ${(waitMs / 1000).toFixed(0)}s entre obras...`);
+        await sleep(waitMs);
       }
     }
 
     if (i < allLists.length - 1) {
-      console.log(`⏳ Esperando ${WAIT_BETWEEN_LISTS / 1000}s entre listas...`);
-      await sleep(WAIT_BETWEEN_LISTS);
+      const waitMs = getHumanDelayMs();
+      console.log(`⏳ Esperando ${(waitMs / 1000).toFixed(0)}s entre listas...`);
+      await sleep(waitMs);
     }
   }
 
@@ -338,7 +389,7 @@
 
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'zonatmo-backup-final-parcial.json';
+  a.download = 'zonatmo-backup-por-listas-completo.json';
   a.click();
 
   console.log(`🎉 Terminado. Registros generados: ${finalResult.length}`);
